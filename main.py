@@ -1,689 +1,1354 @@
-import base64
-import random
+import sys
+import os
+import json
 import time
-import threading
-import tkinter as tk
-from tkinter import simpledialog, Scrollbar, filedialog, ttk
+import random
 import requests
-import cv2
-import numpy as np
-from PIL import Image, ImageTk
-import torch
-import torch.nn as nn
-import torchvision.transforms as transforms
-from torchvision import models
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
-import onnxruntime as ort
+import traceback
+from urllib.parse import urlparse
+from queue import Queue, Empty
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QLineEdit, QTextEdit, QLabel, QMessageBox, QGroupBox, QFormLayout, QComboBox
+)
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
+
+# تأكد من تثبيت gradio_client و playwright-stealth
+# pip install gradio_client playwright playwright-stealth requests httpx
+from gradio_client import Client as GradioClient
+from playwright.sync_api import sync_playwright, Playwright, Browser, Page, BrowserContext, \
+    TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError, Locator
+import httpx  # استيراد httpx للتعامل مع أخطاء الاتصال
+from playwright_stealth import stealth_sync  # تم استيراد stealth_sync
+import re  # Added for regular expressions for HTML stripping
+
+# ==============================================================================
+# 1. الإعدادات والثوابت
+# ==============================================================================
+
+# عنوان البروكسي (قم بتغييره إلى البروكسي الخاص بك)
+PROXY_ADDRESS_HTTP_FULL = "http://56c17f936ca45e8b:9qLbCe3s@res.proxy-seller.com:10002"
+# عناوين URL المستهدفة
+SWAGBUCKS_LOGIN_URL = "https://www.swagbucks.com/p/login"
+SWAGBUCKS_DASHBUCKS_URL = "https://www.swagbucks.com/"  # هذا للتحقق اليدوي/التخطي، لن يستخدمه البوت تلقائياً بعد تسجيل الدخول
+IP_TEST_URL = "http://ip-api.com/json"
+
+# عناوين URL لخدمات الذكاء الاصطناعي
+SELECTOR_AI_URL = "https://serverboot-yourusernamesurveyselectorai.hf.space/"
+ANSWER_AI_URL = "https://omran2211-ask.hf.space/"
+
+# مسار حفظ حالة الجلسة
+SESSION_STORAGE_PATH = "swagbucks_session_state.json"
+SESSION_EXPIRY_HOURS = 4
+
+# إعدادات محاكاة السلوك البشري
+TYPING_DELAY_MS = (80, 250)
+ACTION_DELAY_MS = (1500, 4000)
+SURVEY_NEXT_DELAY_SECONDS = 15
+
+# Viewport Dimensions (أبعاد شاشة عرض عشوائية)
+VIEWPORTS = [
+    {"width": 1366, "height": 768},
+    {"width": 1920, "height": 1080},
+    {"width": 1440, "height": 900},
+    {"width": 1280, "height": 720},
+    {"width": 1536, "height": 864},
+    {"width": 1024, "height": 768},
+]
+
+# User-Agent Strings (سلاسل وكيل مستخدم طبيعية وعناوائية)
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:127.0) Gecko/20100101 Firefox/127.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+]
 
 
-class TrainedModel:
-    def __init__(self, model_path=r"C:\Users\ccl\Desktop\efficientnet_lite_trained.onnx"):
-        start_time = time.time()
-        # إنشاء جلسة ONNX Runtime لتحميل نموذج ONNX
-        self.session = ort.InferenceSession(model_path)
+# ==============================================================================
+# 2. PySide6 Worker Thread
+# ==============================================================================
 
-        # إعداد تحويلات الصورة كما استخدمت أثناء التدريب
-        self.preprocess = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.Grayscale(num_output_channels=3),  # تحويل الصورة إلى 3 قنوات
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
-        ])
+class PlaywrightWorker(QThread):
+    status_update = Signal(str)
+    browser_ready = Signal(bool)
+    login_attempt_complete = Signal(bool)
+    survey_ready = Signal(bool)
+    error_occurred = Signal(str)
+    proxy_test_result = Signal(bool, str)
 
-        print(f"تم تحميل النموذج على CPU في {time.time() - start_time:.5f} ثانية")
+    def __init__(self, proxy_address, parent=None):
+        super().__init__(parent)
+        self.proxy_address = proxy_address
+        self.command_queue = Queue()
+        self._running = True
+        self.is_logged_in = False
 
-    def predict(self, img):
-        """
-        دالة التنبؤ التي:
-          - تستقبل صورة (img) على شكل numpy array كما يخرجها OpenCV (BGR)
-          - تقوم بتحويلها إلى تنسيق PIL وتطبيق التحويلات اللازمة
-          - تمرر الصورة إلى نموذج ONNX للحصول على التنبؤات
-          - تعيد التنبؤ: الرقم الأول، العملية، والرقم الثاني
-        """
-        start_time = time.time()
+        # تهيئة عملاء Gradio
+        self.selector_ai_client = None
+        self.answer_ai_client = None
+        self._initialize_gradio_clients()
 
-        # تحويل الصورة من BGR (OpenCV) إلى RGB وإنشاء كائن PIL
-        pil_image = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        self.playwright_instance: Playwright = None
+        self.browser: Browser = None
+        self.context: BrowserContext = None
+        self.page: Page = None
+        self.is_survey_automation_active = False
+        self.current_persona_id = "01"
 
-        # تطبيق التحويلات على الصورة
-        input_tensor = self.preprocess(pil_image)
-        # إضافة بُعد الدُفعة وتحويلها إلى مصفوفة numpy (ONNX Runtime يعمل مع numpy)
-        input_np = input_tensor.unsqueeze(0).cpu().numpy()
-
-        print(f"معالجة الصورة استغرقت {time.time() - start_time:.5f} ثانية")
-        start_inference = time.time()
-
-        # تشغيل عملية التنبؤ باستخدام ONNX Runtime
-        # تأكد من أن اسم الإدخال مطابق للاسم المُستخدم أثناء التصدير (في هذه الحالة "input")
-        outputs = self.session.run(None, {"input": input_np})
-        # من المفترض أن تكون مخرجات النموذج على شكل (1, 23)؛ نقوم بتسويتها إلى (1, 23) في حالة الحاجة
-        outputs = outputs[0].reshape(1, 23)
-
-        print(f"عملية التنبؤ استغرقت {time.time() - start_inference:.5f} ثانية")
-
-        # تقسيم المخرجات إلى 3 مجموعات:
-        # - أول 10 قنوات للتنبؤ بالرقم الأول
-        # - القنوات من 10 إلى 12 للتنبؤ بالعملية
-        # - القنوات من 13 وما بعدها للتنبؤ بالرقم الثاني
-        num1_preds = outputs[:, :10]
-        op_preds = outputs[:, 10:13]
-        num2_preds = outputs[:, 13:]
-
-        # الحصول على التصنيف لكل جزء
-        num1_predicted = np.argmax(num1_preds, axis=1)[0]
-        op_predicted = np.argmax(op_preds, axis=1)[0]
-        num2_predicted = np.argmax(num2_preds, axis=1)[0]
-
-        # خريطة العمليات لتعيين الفئات إلى رموز العمليات
-        operation_map = {0: "+", 1: "-", 2: "×"}
-        predicted_operation = operation_map.get(op_predicted, "?")
-
-        total_time = time.time() - start_time
-        print(f"إجمالي وقت التنبؤ: {total_time:.5f} ثانية")
-
-        time.sleep(0.035) 
-        
-        return num1_predicted, predicted_operation, num2_predicted
-        
-class ExpandingCircle:
-    def __init__(self, canvas, x, y, max_radius, color):
-        self.canvas = canvas
-        self.x = x
-        self.y = y
-        self.max_radius = max_radius
-        self.radius = 10
-        self.growing = True
-        self.circle = self.canvas.create_oval(self.x - self.radius, self.y - self.radius,
-                                              self.x + self.radius, self.y + self.radius,
-                                              outline=color)
-        self.expand_circle()
-
-    def expand_circle(self):
-        if self.growing:
-            self.radius += 2
-            if self.radius >= self.max_radius:
-                self.growing = False
-        else:
-            self.radius -= 2
-            if self.radius <= 10:
-                self.growing = True
-
-        self.canvas.coords(self.circle, self.x - self.radius, self.y - self.radius,
-                           self.x + self.radius, self.y + self.radius)
-        self.job = self.canvas.after(50, self.expand_circle)
-
-    def stop(self):
-        if hasattr(self, 'job'):
-            self.canvas.after_cancel(self.job)
-        self.canvas.delete(self.circle)
-
-
-class CaptchaApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Captcha Solver with Improved Deep Learning")
-        self.root.geometry("1000x600")
-        self.accounts = {}
-        self.background_images = []
-        self.last_status_code = None
-        self.last_response_text = None
-        self.captcha_frame = None
-        self.trained_model = None
-        self.canvas = None
-        self.scrollbar = None
-        self.main_frame = None
-        self.add_account_button = None
-        self.upload_background_button = None
-        self.notification_label = None
-        self.time_label = None
-        self.executor = ThreadPoolExecutor(max_workers=4)
-
-        self.load_model()
-        self.setup_ui()
-
-    def load_model(self):
-        print("Loading model...")
-        start_time = time.time()
-        self.trained_model = TrainedModel()
-        print(f"Model loaded and ready in {time.time() - start_time:.4f} seconds")
-
-    def setup_ui(self):
-        self.canvas = tk.Canvas(self.root)
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.scrollbar = Scrollbar(self.root, orient=tk.VERTICAL, command=self.canvas.yview)
-        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-        self.main_frame = tk.Frame(self.canvas)
-        self.main_frame.pack(fill=tk.BOTH, expand=True)
-        self.canvas.create_window((0, 0), window=self.main_frame, anchor=tk.NW)
-        self.main_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.notification_label = tk.Label(self.root, text="", fg="white", bg="blue", font=("Helvetica", 12))
-        self.notification_label.pack(fill=tk.X)
-        self.time_label = tk.Label(self.root, text="", fg="white", bg="black", font=("Helvetica", 12))
-        self.time_label.pack(side=tk.BOTTOM, fill=tk.X)
-
-        self.create_widgets()
-
-    def create_widgets(self):
-        self.add_account_button = tk.Button(self.main_frame, text="Add Account", command=self.add_account)
-        self.add_account_button.pack()
-
-        self.upload_background_button = tk.Button(self.main_frame, text="Upload Backgrounds",
-                                                  command=self.upload_backgrounds)
-        self.upload_background_button.pack()
-
-        self.login_button = tk.Button(self.main_frame, text="Login", command=self.login_saved_accounts)
-        self.login_button.pack()
-
-    def login_saved_accounts(self):
-        for username, account_info in self.accounts.items():
-            session = account_info.get("session")
-            if not session or not self.is_session_valid(session):
-                user_agent = self.generate_user_agent()
-                session = self.create_session(user_agent)
-                password = account_info.get("password")
-
-                if self.login(username, password, session):
-                    self.accounts[username]["session"] = session
-                    self.update_notification(f"Login successful for {username}", "green")
-                else:
-                    self.update_notification(f"Login failed for {username}", "red")
-
-    def is_session_valid(self, session):
+    def _initialize_gradio_clients(self):
+        """تهيئة أو إعادة تهيئة عملاء Gradio."""
         try:
-            test_url = "https://api.ecsc.gov.sy:8443/some_endpoint_to_check_session"
-            response = session.get(test_url, verify=False)
-            return response.status_code == 200
-        except requests.RequestException:
-            return False
-
-    def create_account_ui(self, username):
-        account_frame = tk.Frame(self.main_frame)
-        account_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        tk.Label(account_frame, text=f"Account: {username}").pack(side=tk.LEFT)
-
-        captcha_id1 = simpledialog.askstring("Input", "Enter Captcha ID 1:")
-        captcha_id2 = simpledialog.askstring("Input", "Enter Captcha ID 2:")
-
-        self.accounts[username]["captcha_id1"] = captcha_id1
-        self.accounts[username]["captcha_id2"] = captcha_id2
-
-        loading_indicator1 = ttk.Progressbar(account_frame, mode='indeterminate')
-        loading_indicator2 = ttk.Progressbar(account_frame, mode='indeterminate')
-
-        cap1_button = tk.Button(account_frame, text="Cap 1",
-                                command=lambda: threading.Thread(
-                                    target=self.request_captcha,
-                                    args=(username, captcha_id1, loading_indicator1)
-                                ).start())
-        cap1_button.pack(padx=8, pady=5)
-        loading_indicator1.pack(padx=8, pady=5)
-
-        cap2_button = tk.Button(account_frame, text="Cap 2",
-                                command=lambda: threading.Thread(
-                                    target=self.request_captcha,
-                                    args=(username, captcha_id2, loading_indicator2)
-                                ).start())
-        cap2_button.pack(padx=8, pady=5)
-        loading_indicator2.pack(padx=8, pady=5)
-
-    def request_captcha(self, username, captcha_id, loading_indicator):
-        loading_indicator.start()
-
-        session = self.accounts[username].get("session")
-        if not session:
-            self.update_notification(f"No session found for user {username}", "red")
-            loading_indicator.stop()
-            return
-
-        self.spinner_canvas = tk.Canvas(self.main_frame, width=100, height=100)
-        self.spinner_canvas.pack(pady=10)
-        self.spinner = ExpandingCircle(self.spinner_canvas, 50, 50, 30, 'blue')
-
-    def request_captcha(self, username, captcha_id, loading_indicator):
-        loading_indicator.start()
-
-        session = self.accounts[username].get("session")
-        if not session:
-            self.update_notification(f"No session found for user {username}", "red")
-            loading_indicator.stop()
-            return
-
-        self.spinner_canvas = tk.Canvas(self.main_frame, width=100, height=100)
-        self.spinner_canvas.pack(pady=10)
-        self.spinner = ExpandingCircle(self.spinner_canvas, 50, 50, 30, 'blue')
-
-        def request_thread():
-            try:
-                captcha_data = self.get_captcha(session, captcha_id, username)
-                if captcha_data:
-                    self.executor.submit(self.show_captcha, captcha_data, username, captcha_id)
-                # تم عرض الرد من الخادم فقط في get_captcha
-            finally:
-                # إيقاف السبينر وعناصر التحميل فور استلام أي رد
-                loading_indicator.stop()
-                self.spinner.stop()
-                self.spinner_canvas.pack_forget()
-
-        threading.Thread(target=request_thread).start()
-
-    def get_captcha(self, session, captcha_id, username):
-        try:
-            captcha_url = f"https://api.ecsc.gov.sy:8443/files/fs/captcha/{captcha_id}"
-            while True:
-                response = session.get(captcha_url, verify=False)
-
-                # عرض رد الخادم فقط مهما كان نوع الرد
-                self.update_notification(f"Server Response: {response.text}",
-                                         "green" if response.status_code == 200 else "red")
-
-                # إرجاع البيانات إذا كان الرد ناجحًا
-                if response.status_code == 200:
-                    response_data = response.json()
-                    return response_data.get("file")
-                elif response.status_code == 4295:
-                    # في حالة تجاوز الحد، نعيد المحاولة
-                    time.sleep(0.1)
-                elif response.status_code in {401, 403}:
-                    # محاولة إعادة تسجيل الدخول في حالة الحاجة
-                    if self.login(username, self.accounts[username]["password"], session):
-                        continue
-                else:
-                    # إيقاف التكرار عند أي رد آخر
-                    break
+            if self.selector_ai_client is None:
+                self.selector_ai_client = GradioClient(SELECTOR_AI_URL)
+                self.status_update.emit(f"✅ تم تهيئة عميل Selector AI بنجاح من: {SELECTOR_AI_URL}")
         except Exception as e:
-            self.update_notification(f"Error: {str(e)}", "red")
-        finally:
-            # إيقاف جميع عناصر الانتظار عند استلام أي رد من الخادم
-            if hasattr(self, 'spinner'):
-                self.spinner.stop()
-            if hasattr(self, 'spinner_canvas'):
-                self.spinner_canvas.pack_forget()
+            self.selector_ai_client = None
+            self.error_occurred.emit(f"❌ خطأ مبدئي في تهيئة عميل Selector AI: {e}\n{traceback.format_exc()}")
+
+        try:
+            if self.answer_ai_client is None:
+                self.answer_ai_client = GradioClient(ANSWER_AI_URL)
+                self.status_update.emit(f"✅ تم تهيئة عميل Answer AI بنجاح من: {ANSWER_AI_URL}")
+        except Exception as e:
+            self.answer_ai_client = None
+            self.error_occurred.emit(f"❌ خطأ مبدئي في تهيئة عميل Answer AI: {e}\n{traceback.format_exc()}")
+
+    def run(self):
+        self.status_update.emit("خيط Playwright العامل بدأ.")
+
+        try:
+            self.playwright_instance = sync_playwright().start()
+            self.status_update.emit("Playwright بدأ بنجاح في خيط العامل.")
+            self.browser_ready.emit(False)
+        except Exception as e:
+            self.error_occurred.emit(f"خطأ فادح في بدء Playwright: {e}\n{traceback.format_exc()}")
+            self._running = False
+            self.browser_ready.emit(False)
+            self._close_playwright_resources()
+            return
+
+        while self._running:
+            try:
+                command, args, kwargs = self.command_queue.get(timeout=0.1)
+
+                if command == "shutdown":
+                    self._running = False
+                    self.status_update.emit("تلقى أمر الإغلاق. جاري إيقاف الخيط.")
+                    break
+
+                elif command == "start_browser_session":
+                    self._start_browser_session()
+
+                elif command == "navigate_to_url":
+                    self._navigate_to_url(*args, **kwargs)
+
+                elif command == "perform_login":
+                    self._perform_login(*args, **kwargs)
+
+                elif command == "test_proxy_requests":
+                    self._test_http_connection_requests_task(*args, **kwargs)
+
+                elif command == "set_persona_id":
+                    self.current_persona_id = args[0]
+                    self.status_update.emit(f"تم تعيين Persona ID إلى: {self.current_persona_id}")
+
+                elif command == "confirm_login_and_save_session":
+                    self.is_logged_in = True
+                    self._save_session_state()
+                    self.status_update.emit("✅ تم تأكيد تسجيل الدخول يدوياً وحفظ الجلسة.")
+                    self.login_attempt_complete.emit(True)
+
+                elif command == "start_survey_automation":
+                    if self.is_logged_in:
+                        self._start_survey_automation()
+                    else:
+                        self.error_occurred.emit("لا يمكن بدء الأتمتة. يرجى تسجيل الدخول وتأكيد الجلسة أولاً.")
+
+                elif command == "stop_survey_automation":
+                    self._stop_survey_automation()
+
+                elif command == "answer_survey_question":
+                    self._answer_survey_question()
+
+                elif command == "stop_browser_session":
+                    self._close_browser_only()
+                    self.is_logged_in = False
+
+            except Empty:
+                pass
+            except Exception as e:
+                self.error_occurred.emit(f"خطأ في معالجة الأمر في خيط العامل: {e}\n{traceback.format_exc()}")
+
+            if self.is_survey_automation_active and self.page:
+                pass
+
+        self._close_playwright_resources()
+        self.status_update.emit("خيط Playwright العامل توقف.")
+
+    def send_command(self, command: str, *args, **kwargs):
+        """ترسل أمرًا إلى قائمة انتظار الأوامر الخاصة بخيط العامل."""
+        if self._running:
+            self.command_queue.put((command, args, kwargs))
+        else:
+            self.error_occurred.emit(f"لا يمكن إرسال الأمر '{command}'. خيط العامل غير نشط.")
+
+    def _handle_new_page(self, new_page: Page):
+        """
+        يتم استدعاء هذه الدالة عندما يفتح المتصفح صفحة جديدة (تبويبة).
+        تقوم بتحديث مرجع self.page إلى الصفحة الجديدة وتنتظر تحميلها.
+        """
+        self.status_update.emit(f"⚠️ تم اكتشاف صفحة جديدة (تبويبة). URL: {new_page.url}")
+        if self.page and self.page != new_page:
+            try:
+                self.status_update.emit(f"جاري إغلاق الصفحة القديمة: {self.page.url}")
+            except Exception as e:
+                self.error_occurred.emit(f"خطأ أثناء إغلاق الصفحة القديمة: {e}")
+
+        self.page = new_page
+        self.status_update.emit(f"✅ تم التبديل إلى الصفحة الجديدة: {self.page.url}")
+        try:
+            self.page.wait_for_load_state('load', timeout=30000)
+            self.status_update.emit(f"✅ تم تحميل DOM للصفحة الجديدة: {self.page.url}")
+            self.page.wait_for_load_state('networkidle', timeout=30000)
+            self.status_update.emit(f"✅ تم استقرار الشبكة للصفحة الجديدة: {self.page.url}")
+        except PlaywrightTimeoutError:
+            self.error_occurred.emit(f"مهلة انتظار تحميل/استقرار الصفحة الجديدة: {self.page.url}")
+        except Error as e:
+            self.error_occurred.emit(f"خطأ Playwright أثناء انتظار تحميل الصفحة الجديدة: {e}\n{traceback.format_exc()}")
+        except Exception as e:
+            self.error_occurred.emit(f"خطأ عام أثناء انتظار تحميل الصفحة الجديدة: {e}\n{traceback.format_exc()}")
+
+    def _start_browser_session(self):
+        """يبدأ جلسة Playwright ويجهز المتصفح."""
+        self.status_update.emit("جاري بدء جلسة المتصفح...")
+        try:
+            parsed_proxy = urlparse(self.proxy_address)
+            playwright_proxy_config = {
+                'server': f"{parsed_proxy.scheme}://{parsed_proxy.hostname}:{parsed_proxy.port}"
+            }
+            if parsed_proxy.username:
+                playwright_proxy_config['username'] = parsed_proxy.username
+            if parsed_proxy.password:
+                playwright_proxy_config['password'] = parsed_proxy.password
+
+            selected_user_agent = random.choice(USER_AGENTS)
+            selected_viewport = random.choice(VIEWPORTS)
+
+            if self.browser:
+                self.browser.close()
+                self.browser = None
+                self.context = None
+                self.page = None
+                self.is_logged_in = False
+
+            self.browser = self.playwright_instance.firefox.launch(
+                headless=False,
+                proxy=playwright_proxy_config
+            )
+
+            if os.path.exists(SESSION_STORAGE_PATH):
+                with open(SESSION_STORAGE_PATH, 'r') as f:
+                    session_data = json.load(f)
+
+                saved_timestamp = session_data.get('timestamp')
+                if saved_timestamp and (time.time() - saved_timestamp < SESSION_EXPIRY_HOURS * 3600):
+                    self.status_update.emit("تم العثور على جلسة سابقة صالحة. جاري تحميلها.")
+                    self.context = self.browser.new_context(
+                        storage_state=session_data['state'],
+                        user_agent=selected_user_agent,
+                        viewport=selected_viewport,
+                        locale="en-US"
+                    )
+                    self.is_logged_in = True
+                    self.status_update.emit("✅ تم تحميل الجلسة بنجاح، مفترض تسجيل الدخول.")
+                else:
+                    self.status_update.emit("الجلسة السابقة منتهية الصلاحية أو غير موجودة. جاري بدء جلسة جديدة.")
+                    self.context = self.browser.new_context(
+                        user_agent=selected_user_agent,
+                        viewport=selected_viewport,
+                        locale="en-US"
+                    )
+                    self.is_logged_in = False
+            else:
+                self.status_update.emit("لم يتم العثور على ملف جلسة. جاري بدء جلسة جديدة.")
+                self.context = self.browser.new_context(
+                    user_agent=selected_user_agent,
+                    viewport=selected_viewport,
+                    locale="en-US"
+                )
+                self.is_logged_in = False
+
+            self.context.on("page", lambda page: self._handle_new_page(page))
+            self.status_update.emit("تم إعداد مستمع الصفحات الجديدة.")
+
+            self.page = self.context.new_page()
+            self.page.set_default_timeout(60000)
+
+            stealth_sync()
+            self.status_update.emit("تم تطبيق تقنيات التخفي Playwright-Stealth.")
+
+            self.browser_ready.emit(True)
+            self.status_update.emit("المتصفح جاهز للعمل.")
+
+        except Exception as e:
+            self.error_occurred.emit(f"خطأ في بدء جلسة المتصفح: {e}\n{traceback.format_exc()}")
+            self.browser_ready.emit(False)
+            self.is_logged_in = False
+
+    def _close_browser_only(self):
+        """يغلق المتصفح فقط دون إيقاف Playwright instance."""
+        self.status_update.emit("جاري إغلاق المتصفح فقط...")
+        if self.browser:
+            try:
+                self.browser.close()
+                self.status_update.emit("تم إغلاق المتصفح.")
+            except Exception as e:
+                self.error_occurred.emit(f"خطأ أثناء إغلاق المتصفح: {e}")
+            self.browser = None
+            self.context = None
+            self.page = None
+            self.is_logged_in = False
+        self.browser_ready.emit(False)
+
+    def _close_playwright_resources(self):
+        """يغلق موارد Playwright (المتصفح والمثيل)."""
+        self.status_update.emit("جاري إغلاق موارد Playwright...")
+        if self.browser:
+            self._close_browser_only()
+
+        if self.playwright_instance:
+            try:
+                self.playwright_instance.stop()
+                self.status_update.emit("تم إيقاف Playwright.")
+            except Exception as e:
+                self.error_occurred.emit(f"خطأ أثناء إيقاف Playwright: {e}")
+            self.playwright_instance = None
+        self.browser_ready.emit(False)
+        self.is_logged_in = False
+        self.status_update.emit("تم إغلاق موارد Playwright.")
+
+    def _navigate_to_url(self, target_url: str):
+        """ينتقل إلى URL المستهدف."""
+        if not self.page or self.page.is_closed():
+            self.error_occurred.emit("Playwright ليس جاهزًا (لا توجد صفحة). يرجى تشغيل المتصفح أولاً.")
+            return
+
+        self.status_update.emit(f"جاري الانتقال إلى: {target_url}")
+        try:
+            self.page.evaluate("window.scrollTo(0, document.body.scrollHeight / 4)")
+            time.sleep(random.uniform(0.5, 1.5))
+
+            self.page.goto(target_url, wait_until='domcontentloaded')
+
+            self.page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+            time.sleep(random.uniform(0.5, 1.5))
+
+            current_url = self.page.url
+            current_title = self.page.title()
+            self.status_update.emit(f"✅ تم الوصول إلى URL: {current_url} بنجاح! العنوان: {current_title}")
+            time.sleep(random.uniform(*ACTION_DELAY_MS) / 1000)
+        except PlaywrightTimeoutError as e:
+            self.error_occurred.emit(
+                f"خطأ مهلة Playwright أثناء التنقل إلى {target_url}: {e}\nقد يكون البروكسي بطيئًا جدًا أو الموقع لا يستجيب.")
+            self.status_update.emit(f"URL الحالي عند المهلة: {self.page.url}")
+        except Exception as e:
+            self.error_occurred.emit(
+                f"حدث خطأ غير متوقع أثناء التنقل بـ Playwright إلى {target_url}: {e}\n{traceback.format_exc()}")
+            self.status_update.emit(f"URL الحالي عند الخطأ: {self.page.url}")
+
+    def _test_http_connection_requests_task(self, proxy_address: str):
+        self.status_update.emit(f"جاري اختبار اتصال HTTP/HTTPS عبر Requests عبر: {proxy_address}")
+        try:
+            proxies = {
+                "http": proxy_address,
+                "https": proxy_address
+            }
+
+            response = requests.get(IP_TEST_URL, proxies=proxies, timeout=15)
+            response.raise_for_status()
+
+            data = response.json()
+            if data.get('status') == 'success':
+                self.proxy_test_result.emit(True,
+                                            f"✅ نجاح اختبار البروكسي (Requests - HTTP)! IP: {data['query']}, البلد: {data['country']}")
+            else:
+                self.proxy_test_result.emit(False, f"❌ فشل اختبار البروكسي (Requests - HTTP): {data}")
+
+        except requests.exceptions.ProxyError as pe:
+            self.proxy_test_result.emit(False,
+                                        f"❌ خطأ في البروكسي (Requests - ProxyError): {pe}\nيرجى التحقق من صحة عنوان البروكسي، المنفذ، واسم المستخدم/كلمة المرور.")
+        except requests.exceptions.ConnectionError as ce:
+            self.proxy_test_result.emit(False,
+                                        f"❌ خطأ في الاتصال (Requests - ConnectionError): {ce}\nقد يكون البروكسي غير متاح أو هناك مشكلة في الشبكة.")
+        except requests.exceptions.Timeout:
+            self.proxy_test_result.emit(False,
+                                        "❌ انتهت مهلة الاتصال بالبروكسي (Requests).\nقد يكون البروكسي بطيئاً جداً أو غير مستجيب.")
+        except requests.exceptions.HTTPError as he:
+            self.proxy_test_result.emit(False,
+                                        f"❌ خطأ HTTP (Requests - HTTPError): {he}\nقد تكون المصادقة غير صحيحة أو البروكسي يرفض الاتصال.")
+        except Exception as e:
+            self.proxy_test_result.emit(False,
+                                        f"❌ حدث خطأ غير متوقع أثناء اختبار البروكسي (Requests - HTTP): {e}\n{traceback.format_exc()}")
+
+    def _save_session_state(self):
+        """يحفظ حالة الجلسة (ملفات تعريف الارتباط والتخزين المحلي) إلى ملف."""
+        if self.context:
+            try:
+                state = self.context.storage_state()
+                session_data = {
+                    'state': state,
+                    'timestamp': time.time()
+                }
+                with open(SESSION_STORAGE_PATH, 'w') as f:
+                    json.dump(session_data, f)
+                self.status_update.emit("تم حفظ حالة الجلسة بنجاح.")
+            except Exception as e:
+                self.error_occurred.emit(f"خطأ في حفظ حالة الجلسة: {e}")
+        else:
+            self.status_update.emit("لا توجد جلسة متصفح لحفظها.")
+
+    def _type_slowly_and_humanlike(self, selector: str, text: str):
+        if not self.page or self.page.is_closed():
+            self.error_occurred.emit("لا توجد صفحة متصفح نشطة للكتابة فيها.")
+            return
+
+        self.status_update.emit(f"جاري الكتابة ببطء في حقل '{selector}'...")
+        try:
+            element = self.page.wait_for_selector(selector, state='visible', timeout=10000)
+            if not element:
+                self.error_occurred.emit(f"لم يتم العثور على العنصر '{selector}' للكتابة فيه.")
+                return
+
+            bounding_box = element.bounding_box()
+            if bounding_box:
+                x_center = bounding_box['x'] + bounding_box['width'] / 2
+                y_center = bounding_box['y'] + bounding_box['height'] / 2
+                x_rand = x_center + random.uniform(-bounding_box['width'] * 0.2, bounding_box['width'] * 0.2)
+                y_rand = y_center + random.uniform(-bounding_box['height'] * 0.2, bounding_box['height'] * 0.2)
+                self.page.mouse.move(x_rand, y_rand, steps=random.randint(5, 15))
+                time.sleep(random.uniform(0.1, 0.5))
+                self.page.mouse.click(x_rand, y_rand)
+                time.sleep(random.uniform(0.1, 0.3))
+
+            self.page.fill(selector, "")
+            for char in text:
+                self.page.type(selector, char, delay=random.randint(*TYPING_DELAY_MS))
+            self.status_update.emit(f"تم الانتهاء من الكتابة في {selector}.")
+            time.sleep(random.uniform(*ACTION_DELAY_MS) / 1000)
+        except PlaywrightTimeoutError:
+            self.error_occurred.emit(f"مهلة انتظار المحدد '{selector}' أثناء الكتابة.")
+        except Exception as e:
+            self.error_occurred.emit(f"خطأ أثناء الكتابة ببطء في '{selector}': {e}\n{traceback.format_exc()}")
+
+    def _click_humanlike(self, selector: str, dispatch_change_event: bool = False):
+        if not self.page or self.page.is_closed():
+            self.error_occurred.emit("لا توجد صفحة متصفح نشطة للنقر فيها.")
+            return
+
+        self.status_update.emit(f"جاري النقر بشكل طبيعي على '{selector}'...")
+        try:
+            element = self.page.wait_for_selector(selector, state='visible', timeout=10000)
+            if not element:
+                self.error_occurred.emit(f"لم يتم العثور على العنصر '{selector}' للنقر عليه.")
+                return
+
+            try:
+                element.scroll_into_view_if_needed()
+                time.sleep(random.uniform(0.2, 0.5))
+            except Exception as scroll_e:
+                self.status_update.emit(f"⚠️ فشل التمرير إلى العنصر '{selector}': {scroll_e}")
+
+            bounding_box = element.bounding_box()
+            if bounding_box:
+                x_center = bounding_box['x'] + bounding_box['width'] / 2
+                y_center = bounding_box['y'] + bounding_box['height'] / 2
+                x_rand = x_center + random.uniform(-bounding_box['width'] * 0.2, bounding_box['width'] * 0.2)
+                y_rand = y_center + random.uniform(-bounding_box['height'] * 0.2, bounding_box['height'] * 0.2)
+                self.page.mouse.move(x_rand, y_rand, steps=random.randint(5, 15))
+                time.sleep(random.uniform(0.1, 0.5))
+                self.page.mouse.click(x_rand, y_rand)
+            else:
+                element.click()
+
+            if dispatch_change_event:
+                try:
+                    self.page.evaluate("el => el.dispatchEvent(new Event('change', {bubbles: true}))", element)
+                    self.status_update.emit(f"✅ تم إطلاق حدث 'change' للعنصر '{selector}'.")
+                except Exception as eval_e:
+                    self.status_update.emit(f"⚠️ فشل إطلاق حدث 'change' للعنصر '{selector}': {eval_e}")
+
+            self.status_update.emit(f"✅ تم النقر على '{selector}'.")
+            time.sleep(random.uniform(*ACTION_DELAY_MS) / 1000)
+        except PlaywrightTimeoutError:
+            self.error_occurred.emit(f"مهلة انتظار المحدد '{selector}' أثناء النقر.")
+        except Exception as e:
+            self.error_occurred.emit(f"خطأ أثناء النقر بشكل طبيعي على '{selector}': {e}\n{traceback.format_exc()}")
+
+    def _perform_login(self, username, password):
+        """يقوم بتسجيل الدخول إلى Swagbucks (فقط إدخال البيانات والنقر)."""
+        if not self.page or self.page.is_closed():
+            self.error_occurred.emit("لا توجد صفحة متصفح نشطة لتسجيل الدخول.")
+            self.login_attempt_complete.emit(False)
+            return
+
+        self.status_update.emit(f"جاري محاولة إدخال بيانات تسجيل الدخول لـ: {username} على {self.page.url}")
+        try:
+            if SWAGBUCKS_LOGIN_URL not in self.page.url:
+                self.status_update.emit(f"⚠️ لست على صفحة تسجيل الدخول. URL الحالي: {self.page.url}. جاري الانتقال...")
+                self._navigate_to_url(SWAGBUCKS_LOGIN_URL)
+                self.page.wait_for_load_state('domcontentloaded', timeout=10000)
+
+            self.page.wait_for_selector('input#sbxJxRegEmail', state='visible', timeout=20000)
+            self.page.wait_for_selector('input#sbxJxRegPswd', state='visible', timeout=20000)
+            self.page.wait_for_selector('button#loginBtn', state='visible', timeout=20000)
+            self.status_update.emit("✅ تم العثور على حقول تسجيل الدخول وزر الدخول.")
+
+            self._type_slowly_and_humanlike('input#sbxJxRegEmail', username)
+            self._type_slowly_and_humanlike('input#sbxJxRegPswd', password)
+
+            self.status_update.emit("جاري الضغط على زر تسجيل الدخول. يرجى المراقبة يدوياً.")
+            self._click_humanlike('button#loginBtn')
+
+            self.status_update.emit("✅ تم إدخال بيانات تسجيل الدخول والنقر على الزر. يرجى التأكيد يدوياً.")
+            self.login_attempt_complete.emit(True)
+            self.is_logged_in = False
+
+        except PlaywrightTimeoutError:
+            self.error_occurred.emit(
+                f"مهلة Playwright أثناء إدخال بيانات تسجيل الدخول. URL الحالي: {self.page.url}")
+            self.login_attempt_complete.emit(False)
+        except Exception as e:
+            self.error_occurred.emit(f"خطأ أثناء عملية إدخال بيانات تسجيل الدخول: {e}\n{traceback.format_exc()}")
+            self.login_attempt_complete.emit(False)
+
+    def _extract_full_html_content(self) -> str:
+        """
+        يستخرج كامل محتوى HTML للصفحة الحالية.
+        """
+        if not self.page or self.page.is_closed():
+            self.error_occurred.emit("لا توجد صفحة متصفح نشطة لاستخراج محتوى HTML منها.")
+            return ""
+
+        self.status_update.emit(f"جاري استخراج كامل محتوى HTML من الصفحة الحالية: {self.page.url}...")
+        try:
+            full_html = self.page.content()
+            self.status_update.emit("✅ تم استخراج كامل محتوى HTML بنجاح.")
+            self.status_update.emit(
+                f"--- بداية المحتوى المستخرج ---\n{full_html[:1000]}...\n--- نهاية المحتوى المستخرج ---")
+            return full_html
+        except PlaywrightError as e:
+            self.error_occurred.emit(
+                f"خطأ في استخراج كامل محتوى HTML (Playwright): {e}\n{traceback.format_exc()}")
+            return ""
+        except Exception as e:
+            self.error_occurred.emit(f"خطأ عام في استخراج كامل محتوى HTML: {e}\n{traceback.format_exc()}")
+            return ""
+
+    def _call_selector_ai(self, page_data: str):
+        self.status_update.emit("جاري استدعاء Selector AI...")
+        if self.selector_ai_client is None:
+            self._initialize_gradio_clients()
+            if self.selector_ai_client is None:
+                self.error_occurred.emit("عميل Selector AI غير مهيأ. لا يمكن استدعاء API.")
+                return {"input_type": "error", "error": "Selector AI client not initialized.", "traceback": ""}
+
+        max_retries = 3
+        current_retry = 0
+        while current_retry < max_retries:
+            try:
+                result = self.selector_ai_client.predict(
+                    page_data,
+                    False,
+                    api_name="/identify_selectors"
+                )
+
+                selectors = json.loads(result)
+                self.status_update.emit(f"✅ تم استلام المحددات من Selector AI: {selectors}")
+                return selectors
+            except (json.JSONDecodeError, httpx.ConnectTimeout, httpx.RequestError) as e:
+                current_retry += 1
+                self.error_occurred.emit(
+                    f"❌ خطأ في استدعاء Selector AI (المحاولة {current_retry}/{max_retries}): {e}\nالاستجابة الخام: '{result if 'result' in locals() else 'N/A'}'\n{traceback.format_exc()}")
+                if current_retry < max_retries:
+                    time.sleep(random.uniform(5, 10))
+                else:
+                    self.error_occurred.emit(f"❌ فشل استدعاء Selector AI بعد {max_retries} محاولات.")
+                    return {"input_type": "error", "error": f"Error calling Selector AI: {e}",
+                            "traceback": traceback.format_exc()}
+            except Exception as e:
+                self.error_occurred.emit(f"خطأ في استدعاء Selector AI عبر Gradio Client: {e}\n{traceback.format_exc()}")
+                return {"input_type": "error", "error": f"Error calling Selector AI: {e}",
+                        "traceback": traceback.format_exc()}
+
+    def _call_answer_ai(self, persona_id: str, question_text: str, options_str: str, question_type: str):
+        self.status_update.emit("جاري استدعاء Answer AI...")
+        if self.answer_ai_client is None:
+            self._initialize_gradio_clients()
+            if self.answer_ai_client is None:
+                self.error_occurred.emit("عميل Answer AI غير مهيأ. لا يمكن استدعاء API.")
+                return None
+
+        question_payload = {
+            "questions": [
+                {
+                    "unescaped_question_text": question_text,
+                    "input_type": question_type,
+                    "options_labels": [opt.strip() for opt in options_str.split(',') if
+                                       opt.strip()] if options_str else []
+                }
+            ]
+        }
+        raw_questions_json_to_send = json.dumps(question_payload, ensure_ascii=False, indent=2)
+
+        self.status_update.emit(
+            f"--- بداية بيانات Answer AI المرسلة ---\n{raw_questions_json_to_send}\n--- نهاية بيانات Answer AI المرسلة ---")
+
+        max_retries = 3
+        current_retry = 0
+        while current_retry < max_retries:
+            result = None
+            try:
+                result = self.answer_ai_client.predict(
+                    persona_id,
+                    raw_questions_json_to_send,
+                    api_name="/run_persona_simulation",
+                    fn_index=0,
+                )
+
+                if not result:
+                    self.error_occurred.emit(f"❌ استجابة فارغة من Answer AI. السؤال: {question_text}")
+                    return None
+
+                try:
+                    answer_data = json.loads(result)
+                except json.JSONDecodeError:
+                    # إذا فشل التحويل، نفترض أنه نص عادي ونقوم بتحليله يدوياً
+                    self.status_update.emit("⚠️ استجابة Answer AI ليست JSON. جاري محاولة تحليلها كنص عادي.")
+
+                    # البحث عن الأجزاء المهمة باستخدام regex
+                    question_match = re.search(r'\*\*Question:\*\*\s*(.*?)\s*\*\*Recommended Option\(s\):', result,
+                                               re.DOTALL)
+                    options_match = re.search(
+                        r'\*\*Recommended Option\(s\):\*\*\s*(.*?)\s*\*\*Detailed Persona Answer:', result, re.DOTALL)
+                    answer_match = re.search(r'\*\*Detailed Persona Answer:\*\*\s*(.*?)\s*---', result, re.DOTALL)
+
+                    question_text_parsed = question_match.group(1).strip() if question_match else ""
+                    recommended_options_parsed = options_match.group(1).strip() if options_match else ""
+                    detailed_answer_parsed = answer_match.group(1).strip() if answer_match else ""
+
+                    # بناء قاموس بنفس الهيكل المتوقع
+                    answer_data = {
+                        "unescaped_question_text": question_text_parsed,
+                        "recommended_options": recommended_options_parsed,
+                        "detailed_persona_answer": detailed_answer_parsed,
+                    }
+
+                self.status_update.emit(f"--- بداية رد Answer AI ---")
+                self.status_update.emit(json.dumps(answer_data, indent=2, ensure_ascii=False))
+                self.status_update.emit(f"--- نهاية رد Answer AI ---")
+
+                self.status_update.emit(
+                    f"✅ تم استلام الإجابة من Answer AI: {answer_data.get('detailed_persona_answer', 'N/A')}")
+                return answer_data
+            except (httpx.ConnectTimeout, httpx.RequestError) as e:
+                current_retry += 1
+                self.error_occurred.emit(
+                    f"❌ خطأ في استدعاء Answer AI (المحاولة {current_retry}/{max_retries}): {e}\nالاستجابة الخام: '{result if 'result' in locals() else 'N/A'}'\n{traceback.format_exc()}")
+                if current_retry < max_retries:
+                    time.sleep(random.uniform(5, 10))
+                else:
+                    self.error_occurred.emit(f"❌ فشل استدعاء Answer AI بعد {max_retries} محاولات.")
+                    return None
+            except Exception as e:
+                self.error_occurred.emit(
+                    f"خطأ عام في استدعاء Answer AI عبر Gradio Client: {e}\n{traceback.format_exc()}")
+                return None
         return None
 
-    def show_captcha(self, captcha_data, username, captcha_id):
-        try:
-            if self.captcha_frame:
-                self.captcha_frame.destroy()
-            captcha_base64 = captcha_data.split(",")[1] if "," in captcha_data else captcha_data
-            captcha_image_data = np.frombuffer(base64.b64decode(captcha_base64), dtype=np.uint8)
-            captcha_image = cv2.imdecode(captcha_image_data, cv2.IMREAD_COLOR)
-            if captcha_image is None:
-                print("Failed to decode captcha image from memory.")
-                return
-            start_time = time.time()
-            processed_image = self.process_captcha(captcha_image)
-            processed_image = cv2.resize(processed_image, (200, 114))
-            elapsed_time_bg_removal = time.time() - start_time
-            self.display_captcha_image(processed_image)
-            start_time = time.time()
-            predictions = self.trained_model.predict(processed_image)
-            elapsed_time_prediction = time.time() - start_time
-            ocr_output_text = f"{predictions[0]} {predictions[1]} {predictions[2]}"
-            print(f"Predicted Operation: {ocr_output_text}")
-            self.update_notification(f"Captcha solved in {elapsed_time_prediction:.5f}s", "green")
-            self.update_time_label(
-                f"Background removal: {elapsed_time_bg_removal:.5f}s, Prediction: {elapsed_time_prediction:.5f}s")
-            captcha_solution = self.solve_captcha_from_prediction(predictions)
-            if captcha_solution is not None:
-                self.executor.submit(self.submit_captcha, username, captcha_id, captcha_solution)
+    def _get_element_by_text_content(self, page: Page, text_content: str, parent_element: Locator = None, timeout=5000):
+        """
+        Searches for an element that contains the given text content within its textContent.
+        Can search within a parent_element or the entire page.
+        Returns a Playwright Locator.
+        """
+        # Escape special regex characters in the text, but keep spaces flexible.
+        escaped_text = re.sub(r'[\-\[\]{}()*+?.,\\^$|#]', r'\\\g<0>', text_content).replace(' ', r'\s*')
 
-            self.spinner.stop()
-            self.spinner_canvas.pack_forget()
-
-        except Exception as e:
-            self.update_notification(f"Failed to show captcha: {e}", "red", response.txt)
-            self.spinner.stop()
-            self.spinner_canvas.pack_forget()
-
-    def process_captcha(self, captcha_image):
-        if not self.background_images:
-            return captcha_image
-        best_background = None
-        min_diff = float("inf")
-        for background in self.background_images:
-            background = cv2.resize(background, (captcha_image.shape[1], captcha_image.shape[0]))
-            processed_image = self.remove_background_keep_original_colors(captcha_image, background)
-            gray_diff = cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
-            score = np.sum(gray_diff)
-            if score < min_diff:
-                min_diff = score
-                best_background = background
-        if best_background is not None:
-            cleaned_image = self.remove_background_keep_original_colors(captcha_image, best_background)
-            return cleaned_image
-        else:
-            return captcha_image
-
-    def display_captcha_image(self, captcha_image):
-        self.captcha_frame = tk.Frame(self.root)
-        self.captcha_frame.pack()
-        captcha_image_pil = Image.fromarray(cv2.cvtColor(captcha_image, cv2.COLOR_BGR2RGB))
-        captcha_image_tk = ImageTk.PhotoImage(captcha_image_pil)
-        captcha_label = tk.Label(self.captcha_frame, image=captcha_image_tk)
-        captcha_label.image = captcha_image_tk
-        captcha_label.grid(row=0, column=0, padx=10, pady=10)
-
-    def remove_background_keep_original_colors(self, captcha_image, background_image):
-        # 1. تقليل الدقة لتسريع العملية
-        scale_factor = 0.4
-        captcha_image = cv2.resize(captcha_image, (0, 0), fx=scale_factor, fy=scale_factor)
-        background_image = cv2.resize(background_image, (0, 0), fx=scale_factor, fy=scale_factor)
-
-        # 2. إذا كان GPU مدعومًا، استخدم CUDA لإزالة الخلفية
-        if cv2.cuda.getCudaEnabledDeviceCount() > 0:
-            captcha_image_gpu = cv2.cuda_GpuMat()
-            background_image_gpu = cv2.cuda_GpuMat()
-
-            captcha_image_gpu.upload(captcha_image)
-            background_image_gpu.upload(background_image)
-
-            # حساب الفرق بين الصورتين باستخدام GPU
-            diff_gpu = cv2.cuda.absdiff(captcha_image_gpu, background_image_gpu)
-            diff = diff_gpu.download()
-
-            # تحويل الفرق إلى صورة رمادية
-            gray_gpu = cv2.cuda.cvtColor(diff_gpu, cv2.COLOR_BGR2GRAY)
-            gray = gray_gpu.download()
-
-            # تطبيق العتبة (threshold) على الصورة الرمادية
-            _, mask = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY)
-
-            # رفع القناع إلى GPU
-            mask_gpu = cv2.cuda_GpuMat()
-            mask_gpu.upload(mask)
-
-            # إزالة الخلفية مع الحفاظ على الألوان الأصلية باستخدام GPU
-            result_gpu = cv2.cuda.bitwise_and(captcha_image_gpu, captcha_image_gpu, mask=mask_gpu)
-            result = result_gpu.download()
-
-            return result
-        else:
-            # إذا لم يكن GPU مدعومًا، نستخدم الطريقة العادية
-            diff = cv2.absdiff(captcha_image, background_image)
-            gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-            _, mask = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY)
-            result = cv2.bitwise_and(captcha_image, captcha_image, mask=mask)
-            return result
-
-    def submit_captcha(self, username, captcha_id, captcha_solution):
-        session = self.accounts[username].get("session")
-        if not session:
-            self.update_notification(f"No session found for user {username}", "red")
-            return
-        try:
-            get_url = f"https://api.ecsc.gov.sy:8443/rs/reserve?id={captcha_id}&captcha={captcha_solution}"
-            response = session.get(get_url, verify=False)
-            self.update_notification(f"Server تم التثبيت بنجاح: {response.text}",
-                                     "green" if response.status_code == 200 else "red")
-        except Exception as e:
-            self.update_notification(f"Failed to submit captcha: {e}", "red")
-
-    @staticmethod
-    def generate_user_agent():
-        user_agent_list = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:100.0) Gecko/20100101 Firefox/100.0",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36",
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 15_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1",
-            "Mozilla/5.0 (Linux; Android 12; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.61 Mobile Safari/537.36",
-            "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:98.0) Gecko/20100101 Firefox/98.0",
-            "Mozilla/5.0 (iPad; CPU OS 15_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36",
-            "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.41 Mobile Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; WOW64; rv:92.0) Gecko/20100101 Firefox/92.0",
-            "Mozilla/5.0 (Linux; Android 9; SAMSUNG SM-G960F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.77 Mobile Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 11_6_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15",
-            "Mozilla/5.0 (Windows NT 6.3; WOW64; rv:93.0) Gecko/20100101 Firefox/93.0",
-            "Mozilla/5.0 (Linux; Android 11; Mi 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.210 Mobile Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.71 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:96.0) Gecko/20100101 Firefox/96.0"
+        selectors = [
+            f"text=/{escaped_text}/i",  # Case-insensitive text match with flexible whitespace
+            f"label:has-text('{text_content}')",
+            f"span:has-text('{text_content}')",
+            f"div:has-text('{text_content}')",
+            f"li:has-text('{text_content}')",
+            f"*[aria-label*='{text_content}']",  # Check for aria-label containing text
+            f"*[title*='{text_content}']",  # Check for title containing text
         ]
 
-        return random.choice(user_agent_list)
-
-    def add_account(self):
-        username = simpledialog.askstring("Input", "Enter Username:")
-        password = simpledialog.askstring("Input", "Enter Password:", show="*")
-        if username and password:
-            user_agent = self.generate_user_agent()
-            session = self.create_session(user_agent)
-            start_time = time.time()
-
-            if self.login(username, password, session):
-                elapsed_time = time.time() - start_time
-                self.update_notification(f"Login successful for user {username}. Time: {elapsed_time:.5f}s", "green")
-                self.accounts[username] = {
-                    "password": password,
-                    "user_agent": user_agent,
-                    "session": session,
-                    "captcha_id1": None,
-                    "captcha_id2": None,
-                }
-
-                # إرسال طلب POST لاستخراج المعاملات باستخدام الجلسة الحالية
-                process_data = self.fetch_process_ids(session)
-                if process_data:
-                    self.create_account_ui(username, process_data)
+        target_element = None
+        for sel in selectors:
+            self.status_update.emit(f"🔎 Trying selector: '{sel}' to find element with text '{text_content}'")
+            try:
+                if parent_element:
+                    target_element = parent_element.locator(sel).first.wait_for(state='visible', timeout=timeout)
                 else:
-                    self.update_notification(f"Failed to fetch process IDs for user {username}.", "red")
-            else:
-                elapsed_time = time.time() - start_time
-                self.update_notification(f"Failed to login for user {username}. Time: {elapsed_time:.2f}s", "red")
-
-    def fetch_process_ids(self, session):
-        try:
-            url = "https://api.ecsc.gov.sy:8443/dbm/db/execute"
-            payload = {
-                "ALIAS": "OPkUVkYsyq",
-                "P_USERNAME": "WebSite",
-                "P_PAGE_INDEX": 0,
-                "P_PAGE_SIZE": 100
-            }
-            headers = {
-                "Content-Type": "application/json",
-                "Alias": "OPkUVkYsyq",
-                "Referer": "https://ecsc.gov.sy/requests",
-                "Origin": "https://ecsc.gov.sy",
-            }
-
-            response = session.post(url, json=payload, headers=headers, verify=False)
-            if response.status_code == 200:
-                data = response.json()
-                process_ids = data.get("P_RESULT", [])
-                if process_ids:
-                    return process_ids
-                else:
-                    self.update_notification("No process IDs found.", "red")
-            else:
-                self.update_notification(f"Failed to fetch process IDs. Status code: {response.status_code}", "red")
-        except Exception as e:
-            self.update_notification(f"Error fetching process IDs: {str(e)}", "red")
+                    target_element = page.locator(sel).first.wait_for(state='visible', timeout=timeout)
+                if target_element:
+                    self.status_update.emit(f"✅ Found element for text '{text_content}' using selector: {sel}")
+                    return target_element
+            except PlaywrightTimeoutError:
+                self.status_update.emit(f"❌ Failed to find element with selector: '{sel}'")
+                continue
+            except Exception as e:
+                self.status_update.emit(
+                    f"⚠️ Error finding element with selector '{sel}' for text '{text_content}': {e}")
+                continue
+        self.status_update.emit(
+            f"⛔️ Failed to find any visible element for text: '{text_content}' after trying all selectors.")
         return None
 
-    def create_account_ui(self, username, process_data):
-        account_frame = tk.Frame(self.main_frame)
-        account_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        tk.Label(account_frame, text=f"Account: {username}").pack(side=tk.LEFT)
-
-        for process in process_data:
-            process_id = process.get("PROCESS_ID")
-            center_name = process.get("ZCENTER_NAME", "Unknown Center")
-
-            process_frame = tk.Frame(account_frame)
-            process_frame.pack(fill=tk.X, padx=10, pady=5)
-
-            # إنشاء زر يحتوي على ZCENTER_NAME مع تصغير حجم الخط
-            loading_indicator = ttk.Progressbar(process_frame, mode='indeterminate')
-
-            process_button = tk.Button(process_frame, text=center_name, font=("Helvetica", 10),
-                                       command=lambda pid=process_id, indicator=loading_indicator: threading.Thread(
-                                           target=self.request_captcha,
-                                           args=(username, pid, indicator)
-                                       ).start())
-            process_button.pack(side=tk.LEFT, padx=8, pady=5)
-            loading_indicator.pack(side=tk.LEFT, padx=8, pady=5)
-
-    def request_captcha(self, username, captcha_id, loading_indicator):
-        loading_indicator.start()
-
-        session = self.accounts[username].get("session")
-        if not session:
-            self.update_notification(f"No session found for user {username}", "red")
-            loading_indicator.stop()
+    def _answer_survey_question(self):
+        if not self.is_logged_in:
+            self.error_occurred.emit("لا يمكن الإجابة على الاستبيان. يجب تسجيل الدخول وتأكيد الجلسة أولاً.")
+            self.survey_ready.emit(False)
             return
 
-        self.spinner_canvas = tk.Canvas(self.main_frame, width=100, height=100)
-        self.spinner_canvas.pack(pady=10)
-        self.spinner = ExpandingCircle(self.spinner_canvas, 50, 50, 30, 'blue')
+        if not self.page or self.page.is_closed():
+            self.error_occurred.emit("لا توجد صفحة متصفح نشطة للإجابة على الاستبيان.")
+            self.survey_ready.emit(False)
+            if self.is_survey_automation_active:
+                QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                  lambda: self.send_command("answer_survey_question"))
+            return
 
-        def request_thread():
-            try:
-                captcha_data = self.get_captcha(session, captcha_id, username)
-                if captcha_data:
-                    self.executor.submit(self.show_captcha, captcha_data, username, captcha_id)
-            finally:
-                loading_indicator.stop()
-                self.spinner.stop()
-                self.spinner_canvas.pack_forget()
-
-        threading.Thread(target=request_thread).start()
-
-    def get_captcha(self, session, captcha_id, username):
+        self.status_update.emit(f"جاري معالجة سؤال الاستبيان في URL: {self.page.url}...")
         try:
-            captcha_url = f"https://api.ecsc.gov.sy:8443/files/fs/captcha/{captcha_id}"
-            while True:
-                response = session.get(captcha_url, verify=False)
+            page_data = self._extract_full_html_content()
 
-                self.update_notification(f"Server Response: {response.text}",
-                                         "green" if response.status_code == 200 else "red")
+            if not page_data:
+                self.error_occurred.emit("فشل استخراج بيانات الصفحة للاستبيان. جاري المحاولة مرة أخرى بعد قليل.")
+                self.survey_ready.emit(False)
+                QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                  lambda: self.send_command("answer_survey_question"))
+                return
 
-                if response.status_code == 200:
-                    response_data = response.json()
-                    return response_data.get("file")
-                elif response.status_code == 429:
-                    time.sleep(0.1)
-                elif response.status_code in {401, 403}:
-                    if self.login(username, self.accounts[username]["password"], session):
-                        continue
+            selectors = self._call_selector_ai(page_data)
+
+            if not selectors or selectors.get("input_type") == "error":
+                self.error_occurred.emit(
+                    f"فشل Selector AI في تحديد العناصر: {selectors.get('error', 'None')}. جاري المحاولة مرة أخرى بعد قليل.")
+                self.survey_ready.emit(False)
+                QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                  lambda: self.send_command("answer_survey_question"))
+                return
+
+            # Check for survey completion/end scenarios
+            if selectors.get("input_type") == "end_of_survey":
+                self.status_update.emit("🎉 تم اكتشاف نهاية الاستبيان! جاري إيقاف الأتمتة.")
+                self._stop_survey_automation()
+                return
+            if selectors.get("input_type") == "no_questions_found" or not selectors.get('questions'):
+                self.status_update.emit("⚠️ Selector AI لم يعثر على أسئلة. قد تكون نهاية الاستبيان أو مشكلة.")
+                # Attempt to click any common 'continue' or 'next' button if survey is truly over
+                common_continue_selectors = [
+                    "button:has-text('Submit')", "button:has-text('Continue')", "button:has-text('Next')",
+                    "a:has-text('Submit')", "a:has-text('Continue')", "a:has-text('Next')",
+                    "input[type='submit']", "input[type='button']",
+                ]
+                for sel in common_continue_selectors:
+                    try:
+                        self.status_update.emit(f"محاولة النقر على زر 'متابعة/إنهاء' محتمل: {sel}")
+                        self._click_humanlike(sel)
+                        self.status_update.emit("✅ تم النقر على زر 'متابعة/إنهاء'. جاري انتظار تحميل الصفحة التالية.")
+                        self.page.wait_for_load_state('domcontentloaded', timeout=10000)
+                        QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                          lambda: self.send_command("answer_survey_question"))
+                        return
+                    except Exception:
+                        continue  # Try next selector
+
+                self.error_occurred.emit(
+                    "Selector AI لم يعد أي أسئلة صالحة ولم يتم العثور على زر 'متابعة/إنهاء'. قد لا تكون هذه صفحة استبيان أو انتهى الاستبيان. جاري المحاولة مرة أخرى بعد قليل.")
+                self.survey_ready.emit(False)
+                QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                  lambda: self.send_command("answer_survey_question"))
+                return
+
+            first_question_info = selectors.get("questions")[0] if selectors.get("questions") else {}
+            question_text_for_ai = first_question_info.get("question_text", "")
+            options_from_selector_ai = first_question_info.get("options_labels", [])  # This is crucial
+            input_type = first_question_info.get("input_type", "unknown")
+            submit_button_selector = selectors.get("submit_button_selector")
+
+            # Prioritize question text from Selector AI
+            question_text_from_page = question_text_for_ai
+            self.status_update.emit(f"❓ السؤال الذي سيتم إرساله إلى Answer AI: {question_text_from_page}")
+
+            # Prepare options for Answer AI. Use what Selector AI provided.
+            options_str_for_ai = ", ".join(options_from_selector_ai)
+            self.status_update.emit(f"📝 الخيارات التي تم الحصول عليها من Selector AI: {options_from_selector_ai}")
+
+            answer_data = self._call_answer_ai(self.current_persona_id, question_text_from_page, options_str_for_ai,
+                                               input_type)
+            if not answer_data:
+                self.error_occurred.emit("فشل Answer AI في تقديم إجابة. جاري المحاولة مرة أخرى بعد قليل.")
+                self.survey_ready.emit(False)
+                QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                  lambda: self.send_command("answer_survey_question"))
+                return
+
+            recommended_options_raw = answer_data.get("recommended_options", "").strip()
+            detailed_persona_answer = answer_data.get("detailed_persona_answer", "").strip()
+
+            self.status_update.emit(f"نوع السؤال: {input_type}, الإجابة الموصى بها (خام): {recommended_options_raw}")
+            self.status_update.emit(f"🤖 إجابة الذكاء الاصطناعي المفصلة: {detailed_persona_answer}")
+
+            def css_escape_for_click(s):
+                s = s.replace("'", "\\'").replace('"', '\\"').replace('\\', '\\\\')
+                s = s.replace('$', '\\$')
+                s = s.replace(',', '\\,')
+                s = s.replace('.', '\\.')
+                s = s.replace('#', '\\#')
+                s = s.replace(':', '\\:')
+                s = s.replace(';', '\\;')
+                s = s.replace('(', '\\(')
+                s = s.replace(')', '\\)')
+                s = s.replace('[', '\\[')
+                s = s.replace(']', '\\]')
+                s = s.replace('=', '\\=')
+                s = s.replace('>', '\\>')
+                s = s.replace('+', '\\+')
+                s = s.replace('~', '\\~')
+                s = s.replace('*', '\\*')
+                s = s.replace('^', '\\^')
+                s = s.replace('|', '\\|')
+                s = s.replace('&', '\\&')
+                s = s.replace('!', '\\!')
+                s = s.replace('@', '\\@')
+                s = s.replace('%', '\\%')
+                return s
+
+            if input_type in ["text", "number", "textarea"]:
+                if detailed_persona_answer:
+                    # Attempt to find the input field using selectors provided by Selector AI
+                    input_selector_candidates = first_question_info.get("option_input_selector", "").split(',')
+                    input_found = False
+                    for sel in input_selector_candidates:
+                        sel = sel.strip()
+                        if not sel: continue
+                        try:
+                            self.page.wait_for_selector(sel, state='visible', timeout=2000)
+                            self._type_slowly_and_humanlike(sel, detailed_persona_answer)
+                            input_found = True
+                            break
+                        except PlaywrightTimeoutError:
+                            self.status_update.emit(f"لم يتم العثور على حقل الإدخال باستخدام المحدد: {sel}")
+                            continue
+                    if not input_found:
+                        self.error_occurred.emit(
+                            f"لم يتم العثور على حقل إدخال صالح باستخدام أي من المحددات: {input_selector_candidates}. جاري المحاولة مرة أخرى بعد قليل.")
+                        QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                          lambda: self.send_command("answer_survey_question"))
+                        return
                 else:
-                    break
+                    self.error_occurred.emit(
+                        "لا توجد إجابة نصية للنوع النصي. جاري المحاولة مرة أخرى بعد قليل.")
+                    QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                      lambda: self.send_command("answer_survey_question"))
+                    return
+            elif input_type in ["single_select", "multi_select"]:
+                if recommended_options_raw and recommended_options_raw.lower() not in ['n/a',
+                                                                                       'no_selection_applicable']:
+                    chosen_options_texts = [opt.strip() for opt in recommended_options_raw.split(',') if opt.strip()]
+                    if chosen_options_texts:
+                        for chosen_opt_text in chosen_options_texts:
+                            self.status_update.emit(f"جاري محاولة النقر على الخيار: '{chosen_opt_text}'")
+
+                            # Attempt to find the element by text first
+                            option_element_to_click = self._get_element_by_text_content(self.page, chosen_opt_text,
+                                                                                        timeout=10000)
+
+                            if option_element_to_click:
+                                try:
+                                    # Try to find the actual input (radio/checkbox) associated with the found element
+                                    input_to_click = option_element_to_click.query_selector(
+                                        'input[type="radio"], input[type="checkbox"]')
+
+                                    if input_to_click and not input_to_click.is_checked():
+                                        input_to_click.click()
+                                        self.page.evaluate(
+                                            "el => el.dispatchEvent(new Event('change', {bubbles: true}))",
+                                            input_to_click)
+                                        self.status_update.emit(
+                                            f"✅ تم النقر على input للخيار: {chosen_opt_text} وإطلاق حدث التغيير.")
+                                    elif input_to_click and input_to_click.is_checked():
+                                        self.status_update.emit(
+                                            f"⚠️ الخيار '{chosen_opt_text}' محدد مسبقًا. لا حاجة للنقر.")
+                                    else:
+                                        # If no direct input found, click the containing element itself
+                                        option_element_to_click.click()
+                                        self.page.evaluate(
+                                            "el => el.dispatchEvent(new Event('change', {bubbles: true}))",
+                                            option_element_to_click)
+                                        self.status_update.emit(
+                                            f"✅ تم النقر على العنصر الحاوي للخيار: {chosen_opt_text} وإطلاق حدث التغيير.")
+                                    time.sleep(random.uniform(1.0, 3.0))
+                                except Exception as e:
+                                    self.error_occurred.emit(
+                                        f"خطأ أثناء النقر على الخيار '{chosen_opt_text}': {e}\n{traceback.format_exc()}. جاري المحاولة مرة أخرى بعد قليل.")
+                                    QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                                      lambda: self.send_command("answer_survey_question"))
+                                    return
+                            else:
+                                self.error_occurred.emit(
+                                    f"لم يتم العثور على الخيار '{chosen_opt_text}' في الصفحة خلال المهلة باستخدام أي محدد. URL الحالي: {self.page.url}. جاري المحاولة مرة أخرى بعد قليل.")
+                                QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                                  lambda: self.send_command("answer_survey_question"))
+                                return
+                    else:
+                        self.status_update.emit(
+                            f"⚠️ Answer AI لم يوصِ بخيار محدد لنوع {input_type}. لن يتم النقر على أي خيار. جاري المحاولة مرة أخرى بعد قليل.")
+                        QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                          lambda: self.send_command("answer_survey_question"))
+                        return
+                else:
+                    self.status_update.emit(
+                        "لا توجد خيارات موصى بها للنوع الاختياري. جاري المحاولة مرة أخرى بعد قليل.")
+                    QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                      lambda: self.send_command("answer_survey_question"))
+                    return
+            elif input_type == "grid":
+                if recommended_options_raw:
+                    grid_choices = [choice.strip() for choice in recommended_options_raw.split(';') if choice.strip()]
+                    for choice_pair in grid_choices:
+                        if ':' in choice_pair:
+                            row_label, col_label = [p.strip() for p in choice_pair.split(':', 1)]
+                            self.status_update.emit(
+                                f"جاري محاولة النقر على خيار الشبكة: صف '{row_label}', عمود '{col_label}'")
+
+                            # Find the row element first
+                            row_element = self._get_element_by_text_content(self.page, row_label, timeout=10000)
+
+                            if row_element:
+                                # Then find the column option within that row
+                                col_option_element = self._get_element_by_text_content(self.page, col_label,
+                                                                                       parent_element=row_element,
+                                                                                       timeout=5000)
+
+                                if col_option_element:
+                                    try:
+                                        # Try to find the actual input (radio/checkbox) associated with the found element
+                                        input_to_click = col_option_element.query_selector(
+                                            'input[type="radio"], input[type="checkbox"]')
+
+                                        if input_to_click and not input_to_click.is_checked():
+                                            input_to_click.click()
+                                            self.page.evaluate(
+                                                "el => el.dispatchEvent(new Event('change', {bubbles: true}))",
+                                                input_to_click)
+                                            self.status_update.emit(
+                                                f"✅ تم النقر على input لخيار الشبكة: Row='{row_label}', Column='{col_label}' وإطلاق حدث التغيير.")
+                                        elif input_to_click and input_to_click.is_checked():
+                                            self.status_update.emit(
+                                                f"⚠️ خيار الشبكة '{row_label}', '{col_label}' محدد مسبقًا. لا حاجة للنقر.")
+                                        else:
+                                            # If no direct input found, click the containing element itself
+                                            col_option_element.click()
+                                            self.page.evaluate(
+                                                "el => el.dispatchEvent(new Event('change', {bubbles: true}))",
+                                                col_option_element)
+                                            self.status_update.emit(
+                                                f"✅ تم النقر على العنصر الحاوي لخيار الشبكة: Row='{row_label}', Column='{col_label}' وإطلاق حدث التغيير.")
+                                        time.sleep(random.uniform(1.0, 3.0))
+                                    except Exception as e:
+                                        self.error_occurred.emit(
+                                            f"خطأ أثناء النقر على خيار الشبكة: {e}\n{traceback.format_exc()}. جاري المحاولة مرة أخرى بعد قليل.")
+                                        QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                                          lambda: self.send_command("answer_survey_question"))
+                                        return
+                                else:
+                                    self.error_occurred.emit(
+                                        f"لم يتم العثور على خيار العمود '{col_label}' في الصف '{row_label}'. جاري المحاولة مرة أخرى بعد قليل.")
+                                    QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                                      lambda: self.send_command("answer_survey_question"))
+                                    return
+                            else:
+                                self.error_occurred.emit(
+                                    f"لم يتم العثور على عنصر الصف '{row_label}'. جاري المحاولة مرة أخرى بعد قليل.")
+                                QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                                  lambda: self.send_command("answer_survey_question"))
+                                return
+                        else:
+                            self.status_update.emit(
+                                f"⚠️ تنسيق خيار الشبكة غير صالح: {choice_pair}. يجب أن يكون 'Row:Column'.")
+
+                else:
+                    self.status_update.emit(
+                        "لا توجد خيارات موصى بها للنوع الشبكي. جاري المحاولة مرة أخرى بعد قليل.")
+                    QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                      lambda: self.send_command("answer_survey_question"))
+                    return
+            else:
+                self.error_occurred.emit(
+                    f"نوع سؤال غير مدعوم أو غير محدد: {input_type}. جاري المحاولة مرة أخرى بعد قليل.")
+                self.survey_ready.emit(False)
+                QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                  lambda: self.send_command("answer_survey_question"))
+                return
+
+            if submit_button_selector:
+                self.status_update.emit("جاري الضغط على زر التالي...")
+                try:
+                    button_clicked = False
+                    for sel in submit_button_selector.split(','):
+                        sel = sel.strip()
+                        if not sel: continue
+                        try:
+                            # Wait for the button to be visible AND enabled
+                            self.page.wait_for_selector(sel, state='visible', timeout=15000)
+                            self.page.wait_for_function(
+                                f"document.querySelector('{sel}') && !document.querySelector('{sel}').disabled",
+                                timeout=15000)
+
+                            self._click_humanlike(sel)
+                            button_clicked = True
+                            self.status_update.emit(f"✅ تم الضغط على زر التالي باستخدام المحدد: {sel}.")
+                            break
+                        except PlaywrightTimeoutError:
+                            self.status_update.emit(
+                                f"⚠️ زر التالي غير مرئي أو لم يصبح مفعّلاً خلال المهلة باستخدام المحدد: {sel}.")
+                            continue
+                        except Exception as click_e:
+                            self.error_occurred.emit(
+                                f"خطأ أثناء النقر أو انتظار الزر التالي باستخدام المحدد '{sel}': {click_e}\n{traceback.format_exc()}")
+                            continue
+
+                    if not button_clicked:
+                        self.error_occurred.emit(
+                            f"لم يتم العثور على زر التالي أو لم يصبح ممكناً باستخدام أي من المحددات: {submit_button_selector}. URL الحالي: {self.page.url}. جاري المحاولة مرة أخرى بعد قليل.")
+                        self.survey_ready.emit(False)
+                        QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                          lambda: self.send_command("answer_survey_question"))
+                        return
+
+                    time.sleep(random.uniform(*ACTION_DELAY_MS) / 1000)
+                    # Use a short timeout for networkidle after click to allow the page to transition
+                    self.page.wait_for_load_state('networkidle', timeout=30000)
+                    self.status_update.emit(f"تم تحميل الصفحة التالية. URL الحالي: {self.page.url}")
+                    self.survey_ready.emit(True)  # Signal success, leading to next question if automation active
+                except PlaywrightTimeoutError:
+                    self.error_occurred.emit(
+                        f"مهلة انتظار زر التالي أو لم يصبح ممكناً أو مهلة تحميل الصفحة بعد النقر. URL الحالي: {self.page.url}. جاري المحاولة مرة أخرى بعد قليل.")
+                    self.survey_ready.emit(False)
+                    QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                      lambda: self.send_command("answer_survey_question"))
+                    return
+                except Exception as e:
+                    self.error_occurred.emit(
+                        f"خطأ أثناء الضغط على زر التالي: {e}\n{traceback.format_exc()}. جاري المحاولة مرة أخرى بعد قليل.")
+                    self.survey_ready.emit(False)
+                    QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                      lambda: self.send_command("answer_survey_question"))
+                    return
+            else:
+                self.error_occurred.emit("لم يتم العثور على محدد لزر التالي. جاري المحاولة مرة أخرى بعد قليل.")
+                self.survey_ready.emit(False)
+                QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                                  lambda: self.send_command("answer_survey_question"))
+                return
+
+        except PlaywrightError as e:
+            self.error_occurred.emit(
+                f"خطأ Playwright أثناء الإجابة على الاستبيان: {e}\n{traceback.format_exc()}. جاري المحاولة مرة أخرى بعد قليل.")
+            self.survey_ready.emit(False)
+            self.send_command("answer_survey_question")
         except Exception as e:
-            self.update_notification(f"Error: {str(e)}", "red")
-        finally:
-            if hasattr(self, 'spinner'):
-                self.spinner.stop()
-            if hasattr(self, 'spinner_canvas'):
-                self.spinner_canvas.pack_forget()
-        return None
+            self.error_occurred.emit(
+                f"خطأ عام أثناء الإجابة على الاستبيان: {e}\n{traceback.format_exc()}. جاري المحاولة مرة أخرى بعد قليل.")
+            self.survey_ready.emit(False)
+            self.send_command("answer_survey_question")
 
-    @staticmethod
-    def create_session(user_agent):
-        headers = {
-            "User-Agent": user_agent,
-            "host": "api.ecsc.gov.sy:8443",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "ar,en-US;q=0.7,en;q=0.3",
-            "Referer": "https://ecsc.gov.sy/login",
-            "Content-Type": "application/json",
-            "Source": "WEB",
-            "Origin": "https://ecsc.gov.sy",
-            "Connection": "keep-alive",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
-            "Priority": "u=1",
-        }
-        session = requests.Session()
-        session.headers.update(headers)
-        return session
+    def _start_survey_automation(self):
+        self.is_survey_automation_active = True
+        self.status_update.emit("بدء أتمتة الاستبيان. جاري انتظار السؤال الأول...")
+        self.send_command("answer_survey_question")
 
-    def login(self, username, password, session, retry_count=3):
-        login_url = "https://api.ecsc.gov.sy:8443/secure/auth/login"
-        login_data = {"username": username, "password": password}
-        for attempt in range(retry_count):
-            try:
-                post_response = session.post(login_url, json=login_data, verify=False)
-                if post_response.status_code == 200:
-                    self.update_notification("Login successful.", "green", post_response.text)
-                    return True
-                else:
-                    self.update_notification(f"Login failed. Status code: {post_response.status_code}",
-                                             "red", post_response.text)
-                    return False
-            except requests.RequestException as e:
-                self.update_notification(f"Request error: {e}", "red")
-                return False
+    def _stop_survey_automation(self):
+        self.is_survey_automation_active = False
+        self.status_update.emit("تم إيقاف أتمتة الاستبيان.")
 
-    def press_cab1_twice(self):
-        username = list(self.accounts.keys())[0]
-        captcha_id1 = self.accounts[username]["captcha_id1"]
+    def _answer_survey_question_loop(self):
+        if not self.is_survey_automation_active:
+            return
 
-        self.request_captcha(username, captcha_id1, None)
-        self.check_server_response(username, captcha_id1, attempt=1)
+        self._answer_survey_question()
+        if self.is_survey_automation_active:
+            QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                              lambda: self.worker.send_command("answer_survey_question"))
 
-    def check_server_response(self, username, captcha_id1, attempt):
-        session = self.accounts[username].get("session")
-        captcha_solution = "123"
-        get_url = f"https://api.ecsc.gov.sy:8443/rs/reserve?id={captcha_id1}&captcha={captcha_solution}"
 
-        response = session.get(get_url, verify=False)
-        if response.status_code == 200:
-            self.update_notification(f"Response 200 received after attempt {attempt}. Stopping.", "green")
+# ==============================================================================
+# 3. واجهة المستخدم (PySide6)
+# ==============================================================================
+
+class SwagbucksAutomatorApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Swagbucks Automator")
+        self.setFixedSize(800, 600)
+
+        self.worker = PlaywrightWorker(PROXY_ADDRESS_HTTP_FULL)
+        self.worker.status_update.connect(self.update_status)
+        self.worker.browser_ready.connect(self.on_browser_ready)
+        self.worker.login_attempt_complete.connect(self.on_login_attempt_complete)
+        self.worker.survey_ready.connect(self.on_survey_ready)
+        self.worker.error_occurred.connect(self.show_error_message)
+        self.worker.proxy_test_result.connect(self.handle_proxy_test_result)
+
+        self.init_ui()
+        self.worker.start()
+
+        self.worker.send_command("set_persona_id", self.persona_id_combo.currentText())
+        self.worker.send_command("start_browser_session")
+
+    def init_ui(self):
+        main_layout = QVBoxLayout()
+
+        proxy_browser_group = QGroupBox("التحكم بالبروكسي والمتصفح")
+        proxy_browser_layout = QFormLayout()
+
+        self.proxy_address_label = QLabel(f"عنوان البروكسي: {PROXY_ADDRESS_HTTP_FULL}")
+        proxy_browser_layout.addRow(self.proxy_address_label)
+
+        self.connect_proxy_btn = QPushButton("اختبار اتصال البروكسي (Requests)")
+        self.connect_proxy_btn.clicked.connect(self.test_proxy_connection)
+        proxy_browser_layout.addRow(self.connect_proxy_btn)
+
+        self.launch_browser_btn = QPushButton("تشغيل المتصفح والانتقال لصفحة تسجيل الدخول")
+        self.launch_browser_btn.clicked.connect(self.launch_browser_and_go_login)
+        self.launch_browser_btn.setEnabled(False)
+        proxy_browser_layout.addRow(self.launch_browser_btn)
+
+        self.close_browser_btn = QPushButton("إغلاق المتصفح")
+        self.close_browser_btn.clicked.connect(self.close_browser)
+        self.close_browser_btn.setEnabled(False)
+        proxy_browser_layout.addRow(self.close_browser_btn)
+
+        proxy_browser_group.setLayout(proxy_browser_layout)
+        main_layout.addWidget(proxy_browser_group)
+
+        login_group = QGroupBox("تسجيل الدخول إلى Swagbucks")
+        login_layout = QFormLayout()
+
+        self.email_input = QLineEdit()
+        self.email_input.setPlaceholderText("أدخل بريدك الإلكتروني")
+        login_layout.addRow("البريد الإلكتروني:", self.email_input)
+
+        self.password_input = QLineEdit()
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.password_input.setPlaceholderText("أدخل كلمة المرور")
+        login_layout.addRow("كلمة المرور:", self.password_input)
+
+        self.login_btn = QPushButton("تسجيل الدخول (إدخال البيانات فقط)")
+        self.login_btn.clicked.connect(self.start_login_process)
+        self.login_btn.setEnabled(False)
+        login_layout.addRow(self.login_btn)
+
+        self.confirm_login_btn = QPushButton("تأكيد تسجيل الدخول يدوياً وحفظ الجلسة")
+        self.confirm_login_btn.clicked.connect(self.confirm_login_manually)
+        self.confirm_login_btn.setEnabled(False)
+        login_layout.addRow(self.confirm_login_btn)
+
+        self.skip_login_btn = QPushButton("تخطي تسجيل الدخول (إذا كانت الجلسة محفوظة)")
+        self.skip_login_btn.clicked.connect(self.skip_login_process)
+        self.skip_login_btn.setEnabled(False)
+        login_layout.addRow(self.skip_login_btn)
+
+        login_group.setLayout(login_layout)
+        main_layout.addWidget(login_group)
+
+        survey_group = QGroupBox("أتمتة الاستبيان")
+        survey_layout = QVBoxLayout()
+
+        persona_selection_layout = QHBoxLayout()
+        self.persona_id_label = QLabel("اختيار الشخصية (Persona ID):")
+        self.persona_id_combo = QComboBox()
+        self.persona_id_combo.addItems([f"{i:02d}" for i in range(1, 11)])
+        self.persona_id_combo.setCurrentText("01")
+        self.persona_id_combo.currentIndexChanged.connect(self.on_persona_id_changed)
+        persona_selection_layout.addWidget(self.persona_id_label)
+        persona_selection_layout.addWidget(self.persona_id_combo)
+        survey_layout.addLayout(persona_selection_layout)
+
+        self.answer_now_btn = QPushButton("أجب الآن (بدء الأتمتة)")
+        self.answer_now_btn.clicked.connect(self.start_survey_automation)
+        self.answer_now_btn.setEnabled(False)
+        survey_layout.addWidget(self.answer_now_btn)
+
+        self.stop_automation_btn = QPushButton("إيقاف الأتمتة")
+        self.stop_automation_btn.clicked.connect(self.stop_survey_automation)
+        self.stop_automation_btn.setEnabled(False)
+        survey_layout.addWidget(self.stop_automation_btn)
+
+        survey_group.setLayout(survey_layout)
+        main_layout.addWidget(survey_group)
+
+        self.status_label = QLabel("الحالة: جاهز.")
+        main_layout.addWidget(self.status_label)
+
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setPlaceholderText("سجل النشاطات يظهر هنا...")
+        main_layout.addWidget(self.log_output)
+
+        self.setLayout(main_layout)
+
+    def update_status(self, message: str):
+        self.status_label.setText(f"الحالة: {message}")
+        self.log_output.append(message)
+
+    def show_error_message(self, message: str):
+        QMessageBox.critical(self, "خطأ", message)
+        self.log_output.append(f"<span style='color:red;'>خطأ: {message}</span>")
+
+    def test_proxy_connection(self):
+        self.update_status("جاري اختبار اتصال البروكسي (Requests)...")
+        self.worker.send_command("test_proxy_requests", PROXY_ADDRESS_HTTP_FULL)
+
+    def handle_proxy_test_result(self, success: bool, message: str):
+        if success:
+            self.update_status(message)
         else:
-            self.update_notification(f"Response {response.status_code} after attempt {attempt}.", "red")
-            if attempt == 1:
-                self.update_notification("Pressing 'cap1' again.", "yellow")
-                self.request_captcha(username, captcha_id1, None)
-                self.check_server_response(username, captcha_id1, attempt=2)
+            self.show_error_message(message)
 
-    def upload_backgrounds(self):
-        background_paths = filedialog.askopenfilenames(
-            title="Select Background Images", filetypes=[("Image files", "*.jpg *.png *.jpeg")]
-        )
-        if background_paths:
-            self.background_images = []
-            self.processed_background_signatures = []  # قائمة للاحتفاظ بتواقيع الخلفيات
-            for path in background_paths:
-                background_image = cv2.imread(path)
-                if background_image is not None:
-                    self.background_images.append(background_image)
-                    # حساب التوقيع (الصورة الرمادية للخلفية) وحفظها لتسريع العمليات
-                    resized_bg = cv2.resize(background_image, (0, 0), fx=0.25, fy=0.25)
-                    gray_bg = cv2.cvtColor(resized_bg, cv2.COLOR_BGR2GRAY)
-                    self.processed_background_signatures.append(gray_bg)
-            self.update_notification(
-                f"{len(self.background_images)} background images uploaded and preprocessed successfully!", "green")
+    def launch_browser_and_go_login(self):
+        self.update_status("جاري الانتقال لصفحة تسجيل الدخول...")
+        self.worker.send_command("navigate_to_url", SWAGBUCKS_LOGIN_URL)
 
-    def solve_captcha_from_prediction(self, prediction):
-        num1, operation, num2 = prediction
-        if operation == "+":
-            return num1 + num2
-        elif operation == "-":
-            return abs(num1 - num2)
-        elif operation == "×":
-            return num1 * num2
-        return None
+    def close_browser(self):
+        self.update_status("جاري إغلاق المتصفح...")
+        self.worker.send_command("stop_browser_session")
+        self.confirm_login_btn.setEnabled(False)
+        self.answer_now_btn.setEnabled(False)
 
-    def update_notification(self, message, color, response_text=None):
-        full_message = message
-        if response_text:
-            full_message += f"\nServer Response: {response_text}"
-        self.notification_label.config(text=full_message, bg=color)
+    def on_browser_ready(self, ready: bool):
+        self.launch_browser_btn.setEnabled(ready)
+        self.close_browser_btn.setEnabled(ready)
+        self.login_btn.setEnabled(ready)
+        self.persona_id_combo.setEnabled(ready)
 
-        self.root.after(8000, self.clear_notification)
+        if ready:
+            if os.path.exists(SESSION_STORAGE_PATH):
+                try:
+                    with open(SESSION_STORAGE_PATH, 'r') as f:
+                        session_data = json.load(f)
+                    saved_timestamp = session_data.get('timestamp')
+                    if saved_timestamp and (time.time() - saved_timestamp < SESSION_EXPIRY_HOURS * 3600):
+                        self.skip_login_btn.setEnabled(True)
+                        self.update_status("تم الكشف عن جلسة محفوظة صالحة. يمكنك تخطي تسجيل الدخول.")
+                        self.answer_now_btn.setEnabled(True)
+                    else:
+                        self.skip_login_btn.setEnabled(False)
+                        self.update_status("الجلسة المحفوظة منتهية الصلاحية أو غير صالحة. لا يمكن تخطي تسجيل الدخول.")
+                        self.answer_now_btn.setEnabled(False)
+                except Exception as e:
+                    self.skip_login_btn.setEnabled(False)
+                    self.show_error_message(f"خطأ في قراءة ملف الجلسة: {e}")
+                    self.answer_now_btn.setEnabled(False)
+            else:
+                self.skip_login_btn.setEnabled(False)
+                self.update_status("لم يتم العثور على ملف جلسة محفوظة. لا يمكن تخطي تسجيل الدخول.")
+                self.answer_now_btn.setEnabled(False)
+            self.confirm_login_btn.setEnabled(False)
+        else:
+            self.update_status("المتصفح مغلق أو غير جاهز.")
+            self.answer_now_btn.setEnabled(False)
+            self.stop_automation_btn.setEnabled(False)
+            self.skip_login_btn.setEnabled(False)
+            self.confirm_login_btn.setEnabled(False)
 
-    def clear_notification(self):
-        self.notification_label.config(text="", bg="blue")
+    def start_login_process(self):
+        username = self.email_input.text()
+        password = self.password_input.text()
 
-    def update_time_label(self, message):
-        self.time_label.config(text=message)
+        if not username or not password:
+            self.show_error_message("الرجاء إدخال البريد الإلكتروني وكلمة المرور.")
+            return
+
+        self.update_status("جاري بدء عملية تسجيل الدخول (إدخال البيانات فقط)...")
+        self.login_btn.setEnabled(False)
+        self.confirm_login_btn.setEnabled(True)
+        self.worker.send_command("perform_login", username, password)
+
+    def confirm_login_manually(self):
+        """تأكيد تسجيل الدخول يدوياً وحفظ الجلسة."""
+        self.update_status("جاري تأكيد تسجيل الدخول يدوياً وحفظ الجلسة...")
+        self.confirm_login_btn.setEnabled(False)
+        self.answer_now_btn.setEnabled(True)
+        self.worker.send_command("confirm_login_and_save_session")
+
+    def on_login_attempt_complete(self, success: bool):
+        if success:
+            self.update_status(
+                "عملية إدخال بيانات تسجيل الدخول والنقر اكتملت. يرجى المراجعة يدوياً وتأكيد تسجيل الدخول.")
+        else:
+            self.status_update("فشل في إدخال بيانات تسجيل الدخول. يرجى المحاولة مرة أخرى.")
+            self.login_btn.setEnabled(True)
+            self.confirm_login_btn.setEnabled(False)
+
+    def skip_login_process(self):
+        """يقوم بتخطي عملية تسجيل الدخول وينتقل مباشرة إلى لوحة التحكم."""
+        self.update_status("جاري تخطي تسجيل الدخول والتوجه إلى لوحة التحكم...")
+        self.worker.send_command("navigate_to_url", SWAGBUCKS_DASHBUCKS_URL)
+        self.worker.is_logged_in = True
+        self.answer_now_btn.setEnabled(True)
+        self.login_btn.setEnabled(False)
+        self.skip_login_btn.setEnabled(False)
+        self.confirm_login_btn.setEnabled(False)
+
+    def on_persona_id_changed(self, index):
+        selected_persona_id = self.persona_id_combo.currentText()
+        self.worker.send_command("set_persona_id", selected_persona_id)
+
+    def start_survey_automation(self):
+        if self.worker.is_logged_in:
+            self.update_status("بدء أتمتة الاستبيان...")
+            self.answer_now_btn.setEnabled(False)
+            self.stop_automation_btn.setEnabled(True)
+            self.worker.send_command("start_survey_automation")
+        else:
+            self.show_error_message("لا يمكن بدء الأتمتة. يرجى تسجيل الدخول وتأكيد الجلسة يدوياً أولاً.")
+
+    def stop_survey_automation(self):
+        self.update_status("جاري إيقاف أتمتة الاستبيان...")
+        self.answer_now_btn.setEnabled(True)
+        self.stop_automation_btn.setEnabled(False)
+        self.worker.send_command("stop_survey_automation")
+
+    def on_survey_ready(self, ready: bool):
+        if self.worker.is_survey_automation_active and ready:
+            QTimer.singleShot(SURVEY_NEXT_DELAY_SECONDS * 1000,
+                              lambda: self.worker.send_command("answer_survey_question"))
+        else:
+            self.answer_now_btn.setEnabled(True)
+            self.stop_automation_btn.setEnabled(False)
+
+    def closeEvent(self, event):
+        self.worker.send_command("shutdown")
+        self.worker.wait(5000)
+        if self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait()
+        event.accept()
 
 
+# ==============================================================================
+# 4. نقطة بدء التنفيذ الرئيسية
+# ==============================================================================
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = CaptchaApp(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    window = SwagbucksAutomatorApp()
+    window.show()
+    sys.exit(app.exec())
