@@ -1,9 +1,6 @@
-numpy
-torch
-torchvision
-opencv-python
-pillow
+PySide6
 requests
-pyinstal
-tk
-onnxruntime
+httpx
+gradio_client
+playwright
+playwright-stealth
